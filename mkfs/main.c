@@ -70,6 +70,7 @@ struct mkfs_allocation {
 	u64 metadata;
 	u64 mixed;
 	u64 system;
+	u64 remap;
 };
 
 static bool opt_zero_end = true;
@@ -85,8 +86,9 @@ struct prepare_device_progress {
 	int ret;
 };
 
-static int create_metadata_block_groups(struct btrfs_root *root, bool mixed,
-				struct mkfs_allocation *allocation)
+static int create_metadata_block_groups(struct btrfs_root *root, u64 incompat_flags,
+					struct mkfs_allocation *allocation,
+					u64 metadata_profile)
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct btrfs_trans_handle *trans;
@@ -95,6 +97,8 @@ static int create_metadata_block_groups(struct btrfs_root *root, bool mixed,
 	u64 chunk_start = 0;
 	u64 chunk_size = 0;
 	u64 system_group_size = BTRFS_MKFS_SYSTEM_GROUP_SIZE;
+	const bool mixed = incompat_flags & BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
+	const bool remap_tree = incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE;
 	int ret;
 
 	if (btrfs_is_zoned(fs_info)) {
@@ -159,6 +163,22 @@ static int create_metadata_block_groups(struct btrfs_root *root, bool mixed,
 					     BTRFS_BLOCK_GROUP_METADATA,
 					     chunk_start, chunk_size);
 		allocation->metadata += chunk_size;
+		if (ret)
+			return ret;
+	}
+
+	if (remap_tree) {
+		ret = btrfs_alloc_chunk(trans, fs_info, &chunk_start, &chunk_size,
+					BTRFS_BLOCK_GROUP_METADATA_REMAP);
+		if (ret == -ENOSPC) {
+			error("no space to allocate remap chunk");
+			goto err;
+		}
+		if (ret)
+			return ret;
+		ret = btrfs_make_block_group(trans, fs_info, 0, BTRFS_BLOCK_GROUP_METADATA_REMAP,
+					     chunk_start, chunk_size);
+		allocation->remap += chunk_size;
 		if (ret)
 			return ret;
 	}
@@ -635,22 +655,25 @@ out:
 	return ret;
 }
 
-static int discard_logical_range_mirror(struct btrfs_fs_info *fs_info, int mirror,
-					u64 start, u64 len)
+static int discard_logical_range(struct btrfs_fs_info *fs_info, u64 start, u64 len)
 {
-	struct btrfs_multi_bio *multi = NULL;
 	int ret;
 	u64 cur_offset = 0;
 	u64 cur_len;
 
 	while (cur_offset < len) {
+		struct btrfs_multi_bio *multi = NULL;
 		struct btrfs_device *device;
 
 		cur_len = len - cur_offset;
-		ret = btrfs_map_block(fs_info, READ, start + cur_offset, &cur_len,
-				      &multi, mirror, NULL);
+		ret = btrfs_map_block(fs_info, WRITE, start + cur_offset, &cur_len, &multi, 0, NULL);
 		if (ret)
 			return ret;
+
+		if (multi->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
+			free(multi);
+			return 0;
+		}
 
 		cur_len = min(cur_len, len - cur_offset);
 
@@ -674,22 +697,6 @@ static int discard_logical_range_mirror(struct btrfs_fs_info *fs_info, int mirro
 		multi = NULL;
 		cur_offset += cur_len;
 	}
-
-	return 0;
-}
-
-static int discard_logical_range(struct btrfs_fs_info *fs_info, u64 start, u64 len)
-{
-	int ret, num_copies;
-
-	num_copies = btrfs_num_copies(fs_info, start, len);
-
-	for (int i = 0; i < num_copies; i++) {
-		ret = discard_logical_range_mirror(fs_info, i + 1, start, len);
-		if (ret < 0)
-			return ret;
-	}
-
 	return 0;
 }
 
@@ -1093,6 +1100,48 @@ static int setup_raid_stripe_tree_root(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
+static int setup_remap_tree_root(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *remap_root;
+	struct btrfs_key key = {
+		.objectid = BTRFS_REMAP_TREE_OBJECTID,
+		.type = BTRFS_ROOT_ITEM_KEY,
+		.offset = 0
+	};
+	int ret;
+
+	trans = btrfs_start_transaction(fs_info->tree_root, 0);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		errno = -ret;
+		error_msg(ERROR_MSG_START_TRANS, "%m");
+		return ret;
+	}
+
+	remap_root = btrfs_create_tree(trans, &key);
+	if (IS_ERR(remap_root))  {
+		ret = PTR_ERR(remap_root);
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+	fs_info->remap_root = remap_root;
+	add_root_to_dirty_list(remap_root);
+
+	btrfs_set_super_remap_root(fs_info->super_copy, remap_root->root_item.bytenr);
+	btrfs_set_super_remap_root_generation(fs_info->super_copy, remap_root->root_item.generation);
+	btrfs_set_super_remap_root_level(fs_info->super_copy, remap_root->root_item.level);
+
+	ret = btrfs_commit_transaction(trans, fs_info->tree_root);
+	if (ret) {
+		errno = -ret;
+		error_msg(ERROR_MSG_COMMIT_TRANS, "%m");
+		return ret;
+	}
+
+	return 0;
+}
+
 /* Thread callback for device preparation */
 static void *prepare_one_device(void *ctx)
 {
@@ -1292,6 +1341,66 @@ cleanup:
 	return ret;
 }
 
+static int queue_discard_logical(struct btrfs_fs_info *fs_info, u64 start, u64 len)
+{
+	struct btrfs_multi_bio *multi = NULL;
+	int ret;
+	u64 cur_offset = 0;
+	u64 cur_len = 0;
+
+	while (cur_offset < len) {
+		struct btrfs_device *device;
+
+		cur_len = len - cur_offset;
+		ret = btrfs_map_block(fs_info, WRITE, start + cur_offset, &cur_len, &multi, 0, NULL);
+		if (ret)
+			return ret;
+
+		if (multi->type & BTRFS_BLOCK_GROUP_RAID56_MASK) {
+			free(multi);
+			break;
+		}
+
+		cur_len = min(cur_len, len - cur_offset);
+
+		for (int i = 0; i < multi->num_stripes; i++) {
+			device = multi->stripes[i].dev;
+
+			ret = add_merge_cache_extent(&device->discard,
+					multi->stripes[i].physical, cur_len);
+			if (ret < 0) {
+				free(multi);
+				return ret;
+			}
+		}
+		free(multi);
+		multi = NULL;
+		cur_offset += cur_len;
+	}
+	return 0;
+}
+
+static int discard_all_devices(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_device *dev;
+
+	list_for_each_entry(dev, &fs_info->fs_devices->devices, dev_list) {
+		if (!dev->writeable)
+			continue;
+		for (struct cache_extent *cache = first_cache_extent(&dev->discard);
+		     cache; cache = next_cache_extent(cache)) {
+			int ret;
+
+			ret = device_discard_blocks(dev->fd, cache->start, cache->size);
+			if (ret == EOPNOTSUPP)
+				return 0;
+			if (ret < 0)
+				return ret;
+		}
+	}
+	return 0;
+}
+
 static int discard_free_space(struct btrfs_fs_info *fs_info, u64 metadata_profile)
 {
 	struct btrfs_root *free_space_root;
@@ -1341,7 +1450,7 @@ static int discard_free_space(struct btrfs_fs_info *fs_info, u64 metadata_profil
 		btrfs_item_key_to_cpu(leaf, &key, path.slots[0]);
 
 		if (key.type == BTRFS_FREE_SPACE_EXTENT_KEY) {
-			ret = discard_logical_range(fs_info, key.objectid, key.offset);
+			ret = queue_discard_logical(fs_info, key.objectid, key.offset);
 			if (ret < 0)
 				goto out;
 		} else if (key.type == BTRFS_FREE_SPACE_BITMAP_KEY) {
@@ -1370,7 +1479,7 @@ static int discard_free_space(struct btrfs_fs_info *fs_info, u64 metadata_profil
 				addr = key.objectid + (start_bit * fs_info->sectorsize);
 				length = (end_bit - start_bit) * fs_info->sectorsize;
 
-				ret = discard_logical_range(fs_info, addr, length);
+				ret = queue_discard_logical(fs_info, addr, length);
 				if (ret < 0) {
 					free(bitmap);
 					goto out;
@@ -1384,8 +1493,10 @@ static int discard_free_space(struct btrfs_fs_info *fs_info, u64 metadata_profil
 
 		path.slots[0]++;
 	}
+	btrfs_release_path(&path);
 
-	ret = 0;
+	/* Every discard range is properly queued. Now submit the real discard request. */
+	return discard_all_devices(fs_info);
 
 out:
 	btrfs_release_path(&path);
@@ -1849,13 +1960,38 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 		}
 	}
 
-	/* Block group tree feature requires no-holes and free-space-tree. */
+	/* Remap tree feature requires block-group-tree, no-holes, and free-space-tree. */
+	if (features.incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE) {
+		features.incompat_flags |= BTRFS_FEATURE_INCOMPAT_NO_HOLES;
+		features.compat_ro_flags |=
+			BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE |
+			BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID |
+			BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
+	}
+
+	if (features.incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE &&
+	    features.incompat_flags & BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS) {
+		error("remap-tree not supported with mixed-bg");
+		exit(1);
+	}
+
+	if (features.incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE &&
+	    features.incompat_flags & BTRFS_FEATURE_INCOMPAT_ZONED) {
+		error("remap-tree not supported for zoned devices");
+		exit(1);
+	}
+
+	/*
+	 * Block group tree feature requires no-holes and free-space-tree.
+	 * And if those dependency is disabled, also disable block-group-tree feature.
+	 */
 	if (features.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE &&
 	    (!(features.incompat_flags & BTRFS_FEATURE_INCOMPAT_NO_HOLES) ||
 	     !(features.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE))) {
-		error("block group tree requires no-holes and free-space-tree features");
-		exit(1);
+		warning("disabling block-group-tree feature due to missing no-holes and free-space-tree features");
+		features.compat_ro_flags &= ~BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
 	}
+
 	if (opt_zoned) {
 		const int blkid_version =  blkid_get_library_version(NULL, NULL);
 
@@ -2080,6 +2216,12 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 	    btrfs_bg_type_to_tolerated_failures(data_profile))
 		warning("metadata has lower redundancy than data!\n");
 
+	if (bconf.verbose) {
+		printf("NOTE: default settings have changed in version 6.19 (supported since linux 6.1):\n");
+		printf("      - enable block-group-tree (-O bgt)\n");
+		printf("\n");
+	}
+
 	mkfs_cfg.label = label;
 	memcpy(mkfs_cfg.fs_uuid, fs_uuid, sizeof(mkfs_cfg.fs_uuid));
 	memcpy(mkfs_cfg.dev_uuid, dev_uuid, sizeof(mkfs_cfg.dev_uuid));
@@ -2114,7 +2256,8 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 
 	root = fs_info->fs_root;
 
-	ret = create_metadata_block_groups(root, mixed, &allocation);
+	ret = create_metadata_block_groups(root, features.incompat_flags,
+					   &allocation, metadata_profile);
 	if (ret) {
 		errno = -ret;
 		error("failed to create default block groups: %m");
@@ -2126,6 +2269,15 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 		if (ret < 0) {
 			errno = -ret;
 			error("failed to initialize raid-stripe-tree: %m");
+			goto out;
+		}
+	}
+
+	if (features.incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE) {
+		ret = setup_remap_tree_root(fs_info);
+		if (ret < 0) {
+			errno = -ret;
+			error("failed to initialize remap-tree: %m");
 			goto out;
 		}
 	}
@@ -2263,12 +2415,13 @@ raid_groups:
 		goto out;
 	}
 
-	ret = btrfs_make_subvolume(trans, BTRFS_DATA_RELOC_TREE_OBJECTID,
-				   false);
-	if (ret) {
-		errno = -ret;
-		error("unable to create data reloc tree: %m");
-		goto out;
+	if (!(features.incompat_flags & BTRFS_FEATURE_INCOMPAT_REMAP_TREE)) {
+		ret = btrfs_make_subvolume(trans, BTRFS_DATA_RELOC_TREE_OBJECTID, false);
+		if (ret) {
+			errno = -ret;
+			error("unable to create data reloc tree: %m");
+			goto out;
+		}
 	}
 
 	ret = btrfs_commit_transaction(trans, root);
@@ -2390,6 +2543,10 @@ raid_groups:
 			printf("  Data+Metadata:    %-8s %16s\n",
 				btrfs_group_profile_str(data_profile),
 				pretty_size(allocation.mixed));
+		if (allocation.remap)
+			printf("  Remap:            %-8s %16s\n",
+				btrfs_group_profile_str(metadata_profile),
+				pretty_size(allocation.remap));
 		printf("  System:           %-8s %16s\n",
 			btrfs_group_profile_str(metadata_profile),
 			pretty_size(allocation.system));

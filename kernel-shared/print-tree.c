@@ -241,6 +241,11 @@ static void bg_flags_to_str(u64 flags, char *ret)
 			strncat(ret, "|", BG_FLAG_STRING_LEN);
 		strncat(ret, "SYSTEM", BG_FLAG_STRING_LEN);
 	}
+	if (flags & BTRFS_BLOCK_GROUP_METADATA_REMAP) {
+		if (!empty)
+			strncat(ret, "|", BG_FLAG_STRING_LEN);
+		strncat(ret, "METADATA_REMAP", BG_FLAG_STRING_LEN);
+	}
 	name = btrfs_bg_type_to_raid_name(flags);
 	if (!name) {
 		snprintf(profile, BG_FLAG_STRING_LEN, "UNKNOWN.0x%llx",
@@ -290,12 +295,6 @@ void print_chunk_item(struct extent_buffer *eb, struct btrfs_chunk *chunk)
 	int i;
 	u32 chunk_item_size;
 	char chunk_flags_str[BG_FLAG_STRING_LEN] = {};
-
-	/* The chunk must contain at least one stripe */
-	if (num_stripes < 1) {
-		printf("invalid num_stripes: %u\n", num_stripes);
-		return;
-	}
 
 	chunk_item_size = btrfs_chunk_item_size(num_stripes);
 
@@ -722,6 +721,12 @@ static void print_raid_stripe_key(struct extent_buffer *eb,
 		       (unsigned long long)btrfs_raid_stride_physical_nr(eb, stripe, i));
 }
 
+static void print_remap_key(struct extent_buffer *leaf, u32 item_size,
+			    struct btrfs_remap_item *remap)
+{
+	printf("\t\taddress %llu\n", btrfs_remap_address(leaf, remap));
+}
+
 void print_key_type(FILE *stream, u64 objectid, u8 type)
 {
 	static const char* key_to_str[256] = {
@@ -768,6 +773,9 @@ void print_key_type(FILE *stream, u64 objectid, u8 type)
 		[BTRFS_UUID_KEY_SUBVOL]		= "UUID_KEY_SUBVOL",
 		[BTRFS_UUID_KEY_RECEIVED_SUBVOL] = "UUID_KEY_RECEIVED_SUBVOL",
 		[BTRFS_RAID_STRIPE_KEY]		= "RAID_STRIPE",
+		[BTRFS_IDENTITY_REMAP_KEY]	= "IDENTITY_REMAP",
+		[BTRFS_REMAP_KEY]		= "REMAP",
+		[BTRFS_REMAP_BACKREF_KEY]	= "REMAP_BACKREF",
 	};
 
 	if (type == 0 && objectid == BTRFS_FREE_SPACE_OBJECTID) {
@@ -882,6 +890,9 @@ void print_objectid(FILE *stream, u64 objectid, u8 type)
 		break;
 	case  BTRFS_RAID_STRIPE_TREE_OBJECTID:
 		fprintf(stream, "RAID_STRIPE_TREE");
+		break;
+	case BTRFS_REMAP_TREE_OBJECTID:
+		fprintf(stream, "REMAP_TREE");
 		break;
 	case (u64)-1:
 		fprintf(stream, "-1");
@@ -1650,6 +1661,10 @@ void __btrfs_print_leaf(struct extent_buffer *eb, unsigned int mode)
 		case BTRFS_RAID_STRIPE_KEY:
 			print_raid_stripe_key(eb, item_size, ptr);
 			break;
+		case BTRFS_REMAP_KEY:
+		case BTRFS_REMAP_BACKREF_KEY:
+			print_remap_key(eb, item_size, ptr);
+			break;
 		case BTRFS_DEV_REPLACE_KEY:
 			print_dev_replace_item(eb, ptr);
 			break;
@@ -1940,6 +1955,7 @@ static struct readable_flag_entry incompat_flags_array[] = {
 	DEF_INCOMPAT_FLAG_ENTRY(EXTENT_TREE_V2),
 	DEF_INCOMPAT_FLAG_ENTRY(RAID_STRIPE_TREE),
 	DEF_INCOMPAT_FLAG_ENTRY(SIMPLE_QUOTA),
+	DEF_INCOMPAT_FLAG_ENTRY(REMAP_TREE),
 };
 static const int incompat_flags_num = ARRAY_SIZE(incompat_flags_array);
 

@@ -424,7 +424,7 @@ free-space-tree
 .. _mkfs-feature-block-group-tree:
 
 block-group-tree
-        (kernel support since 6.1)
+        (default since btrfs-progs v6.19, kernel support since 6.1)
 
         Enable a dedicated b-tree for block group items, this greatly reduces
         mount time for large filesystems due to better data locality that
@@ -435,6 +435,11 @@ block-group-tree
         Offline conversion from filesystems that don't have this feature
         enabled at *mkfs* time is possible, see :doc:`btrfstune`. Online
         conversion is not possible.
+
+	.. note::
+		This feature requires ``no-holes`` and ``free-space-tree``
+		features, if these dependency features are disabled,
+		``block-group-tree`` feature will also be disabled automatically.
 
 .. _mkfs-feature-raid-stripe-tree:
 
